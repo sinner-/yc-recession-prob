@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Generated outputs
+*.html
+*_validation.png
+
+
+# xlsx
+*.xlsx
