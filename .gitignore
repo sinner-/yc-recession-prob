@@ -12,3 +12,6 @@ __pycache__/
 
 # xlsx
 *.xlsx
+
+# Local historical input
+zcr-analytical-series-hist.xls

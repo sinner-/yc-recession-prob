@@ -6,6 +6,7 @@
 #   "pandas>=2.2",
 #   "plotly>=6.0",
 #   "scikit-learn>=1.5",
+#   "xlrd>=2.0",
 # ]
 # ///
 
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +32,14 @@ from sklearn.preprocessing import StandardScaler
 
 YIELD_SHEET = "Data"
 GDP_SHEET = "Data1"
+F17_SHEET = "Yields"
+F17_SOURCE_URL = "https://www.rba.gov.au/statistics/tables/xls-hist/zcr-analytical-series-hist.xls"
+F17_DEFAULT_FILE = "zcr-analytical-series-hist.xls"
+GAP_THRESHOLD_DAYS = 10
+ROLLING_3M_DAYS = 63
+ROLLING_6M_DAYS = 126
+TARGET_FORWARD_QUARTERS = 2
+TARGET_COLUMN = "recession_through_next_2q"
 
 YIELD_2Y_TITLE = "Australian Government 2 year bond"
 YIELD_10Y_TITLE = "Australian Government 10 year bond"
@@ -37,17 +47,15 @@ GDP_SERIES_TITLE = "GDP per capita: Chain volume measures - Percentage changes ;
 GDP_SERIES_TYPE = "Seasonally Adjusted"
 
 FEATURE_COLUMNS = [
-    "spread_today",
-    "spread_qtd_mean",
-    "spread_qtd_min",
-    "spread_qtd_inversion_share",
+    "spread_3m_mean",
+    "spread_6m_min",
+    "spread_6m_inversion_share",
 ]
 
 FEATURE_LABELS = {
-    "spread_today": "Today's 10Y-2Y spread",
-    "spread_qtd_mean": "Quarter-to-date average spread",
-    "spread_qtd_min": "Quarter-to-date minimum spread",
-    "spread_qtd_inversion_share": "Quarter-to-date inversion share",
+    "spread_3m_mean": "63-day average 10Y-2Y spread",
+    "spread_6m_min": "126-day minimum 10Y-2Y spread",
+    "spread_6m_inversion_share": "126-day inversion share",
 }
 
 
@@ -68,6 +76,22 @@ class ModelArtifacts:
     coefficients: pd.Series
 
 
+def build_model_pipeline() -> Pipeline:
+    return Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "logit",
+                LogisticRegression(
+                    class_weight="balanced",
+                    solver="liblinear",
+                    random_state=0,
+                ),
+            ),
+        ]
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build an Australia daily per-capita recession indicator HTML dashboard."
@@ -82,6 +106,11 @@ def parse_args() -> argparse.Namespace:
         "--html-out",
         default="australia_recession_indicator.html",
         help="Path for the standalone HTML output.",
+    )
+    parser.add_argument(
+        "--f17-file",
+        default=F17_DEFAULT_FILE,
+        help="Path to the local RBA F17 historical workbook.",
     )
     return parser.parse_args()
 
@@ -102,7 +131,7 @@ def require_column(mask: pd.Series, label: str, options: pd.Series) -> int:
     return int(matches[0])
 
 
-def load_yield_data(path: Path) -> pd.DataFrame:
+def load_current_f2_yield_data(path: Path) -> pd.DataFrame:
     raw = pd.read_excel(path, sheet_name=YIELD_SHEET, header=None)
     titles = raw.iloc[1]
 
@@ -121,28 +150,83 @@ def load_yield_data(path: Path) -> pd.DataFrame:
         .drop_duplicates(subset="date")
         .reset_index(drop=True)
     )
+    data["yield_source"] = "RBA F2"
+    return data
 
+
+def load_f17_yield_data(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing local F17 workbook at {path}. Download it from {F17_SOURCE_URL}."
+        )
+
+    raw = pd.read_excel(path, sheet_name=F17_SHEET, header=None)
+    maturity_row_idx = None
+    two_year_col = None
+    ten_year_col = None
+
+    for idx in range(min(20, len(raw))):
+        numeric_row = pd.to_numeric(raw.iloc[idx], errors="coerce")
+        if numeric_row.notna().sum() < 10:
+            continue
+        if (numeric_row == 2).any() and (numeric_row == 10).any():
+            maturity_row_idx = idx
+            two_year_col = int(numeric_row[numeric_row == 2].index[0])
+            ten_year_col = int(numeric_row[numeric_row == 10].index[0])
+            break
+
+    if maturity_row_idx is None or two_year_col is None or ten_year_col is None:
+        raise ValueError("Could not locate the 2-year and 10-year maturity columns in the F17 workbook.")
+
+    date_series = raw.iloc[:, 0].map(excel_timestamp)
+    data_start = date_series.iloc[maturity_row_idx + 1 :].first_valid_index()
+    if data_start is None:
+        raise ValueError("Could not locate dated yield rows in the F17 workbook.")
+
+    data = pd.DataFrame(
+        {
+            "date": date_series.iloc[data_start:],
+            "yield_2y": pd.to_numeric(raw.iloc[data_start:, two_year_col], errors="coerce"),
+            "yield_10y": pd.to_numeric(raw.iloc[data_start:, ten_year_col], errors="coerce"),
+        }
+    )
+    data = (
+        data.dropna(subset=["date", "yield_2y", "yield_10y"])
+        .sort_values("date")
+        .drop_duplicates(subset="date")
+        .reset_index(drop=True)
+    )
+    data["yield_source"] = "RBA F17"
+    return data
+
+
+def add_yield_features(data: pd.DataFrame) -> pd.DataFrame:
+    data = data.copy()
     data["spread"] = data["yield_10y"] - data["yield_2y"]
     data["quarter"] = data["date"].dt.to_period("Q")
-    data["spread_today"] = data["spread"]
-
-    grouped_spread = data.groupby("quarter")["spread"]
-    data["spread_qtd_mean"] = (
-        grouped_spread.expanding().mean().reset_index(level=0, drop=True).to_numpy()
-    )
-    data["spread_qtd_min"] = (
-        grouped_spread.expanding().min().reset_index(level=0, drop=True).to_numpy()
-    )
-    inversions = (data["spread"] < 0).astype(float)
-    data["spread_qtd_inversion_share"] = (
-        inversions.groupby(data["quarter"])
-        .expanding()
+    data["spread_3m_mean"] = data["spread"].rolling(ROLLING_3M_DAYS, min_periods=ROLLING_3M_DAYS).mean()
+    data["spread_6m_min"] = data["spread"].rolling(ROLLING_6M_DAYS, min_periods=ROLLING_6M_DAYS).min()
+    data["spread_6m_inversion_share"] = (
+        (data["spread"] < 0)
+        .astype(float)
+        .rolling(ROLLING_6M_DAYS, min_periods=ROLLING_6M_DAYS)
         .mean()
-        .reset_index(level=0, drop=True)
-        .to_numpy()
     )
     data["quarter_label"] = data["quarter"].map(format_quarter)
     return data
+
+
+def load_yield_data(current_f2_path: Path, f17_path: Path) -> pd.DataFrame:
+    historical = load_f17_yield_data(f17_path)
+    current = load_current_f2_yield_data(current_f2_path)
+
+    combined = (
+        pd.concat([historical, current], ignore_index=True)
+        .sort_values("date")
+        .drop_duplicates(subset="date", keep="last")
+        .reset_index(drop=True)
+    )
+    return add_yield_features(combined)
 
 
 def load_gdp_data(path: Path) -> pd.DataFrame:
@@ -176,19 +260,26 @@ def load_gdp_data(path: Path) -> pd.DataFrame:
     data["per_capita_recession"] = negative & (
         negative.shift(1, fill_value=False) | negative.shift(-1, fill_value=False)
     )
+    forward_window = pd.concat(
+        [data["per_capita_recession"].shift(-offset).astype(float) for offset in range(TARGET_FORWARD_QUARTERS + 1)],
+        axis=1,
+    )
+    data[TARGET_COLUMN] = forward_window.max(axis=1)
+    data.loc[~forward_window.notna().all(axis=1), TARGET_COLUMN] = np.nan
     data["quarter_label"] = data["quarter"].map(format_quarter)
     return data
 
 
 def build_training_quarters(yields: pd.DataFrame, gdp: pd.DataFrame) -> pd.DataFrame:
+    complete_feature_rows = yields.dropna(subset=FEATURE_COLUMNS).copy()
     quarter_features = (
-        yields.groupby("quarter", as_index=False)
+        complete_feature_rows.groupby("quarter", as_index=False)
         .agg(
             feature_date=("date", "last"),
-            spread_today=("spread_today", "last"),
-            spread_qtd_mean=("spread_qtd_mean", "last"),
-            spread_qtd_min=("spread_qtd_min", "last"),
-            spread_qtd_inversion_share=("spread_qtd_inversion_share", "last"),
+            yield_sources=("yield_source", lambda values: ", ".join(sorted(set(values)))),
+            spread_3m_mean=("spread_3m_mean", "last"),
+            spread_6m_min=("spread_6m_min", "last"),
+            spread_6m_inversion_share=("spread_6m_inversion_share", "last"),
         )
         .sort_values("quarter")
         .reset_index(drop=True)
@@ -201,6 +292,7 @@ def build_training_quarters(yields: pd.DataFrame, gdp: pd.DataFrame) -> pd.DataF
                 "date",
                 "gdp_per_capita_qoq",
                 "per_capita_recession",
+                TARGET_COLUMN,
                 "quarter_label",
             ]
         ],
@@ -208,14 +300,16 @@ def build_training_quarters(yields: pd.DataFrame, gdp: pd.DataFrame) -> pd.DataF
         how="inner",
         suffixes=("", "_gdp"),
     )
-    if training["per_capita_recession"].nunique() < 2:
+    training = training.dropna(subset=[TARGET_COLUMN]).copy()
+    training[TARGET_COLUMN] = training[TARGET_COLUMN].astype(int)
+    if training[TARGET_COLUMN].nunique() < 2:
         raise ValueError("Training sample does not contain both recession and non-recession quarters.")
     return training
 
 
 def validate_model(training_quarters: pd.DataFrame) -> ValidationSummary:
     X = training_quarters[FEATURE_COLUMNS].to_numpy()
-    y = training_quarters["per_capita_recession"].astype(int).to_numpy()
+    y = training_quarters[TARGET_COLUMN].astype(int).to_numpy()
 
     if len(training_quarters) < 10:
         return ValidationSummary(folds_used=0, auc=None, brier=None)
@@ -231,19 +325,7 @@ def validate_model(training_quarters: pd.DataFrame) -> ValidationSummary:
         if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
             continue
 
-        fold_model = Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                (
-                    "logit",
-                    LogisticRegression(
-                        class_weight="balanced",
-                        solver="liblinear",
-                        random_state=0,
-                    ),
-                ),
-            ]
-        )
+        fold_model = build_model_pipeline()
         fold_model.fit(X[train_idx], y_train)
         fold_predictions = fold_model.predict_proba(X[test_idx])[:, 1]
         predictions.extend(fold_predictions.tolist())
@@ -264,26 +346,18 @@ def fit_indicator(yields: pd.DataFrame, gdp: pd.DataFrame) -> ModelArtifacts:
     training_quarters = build_training_quarters(yields, gdp)
     validation = validate_model(training_quarters)
 
-    model = Pipeline(
-        [
-            ("scaler", StandardScaler()),
-            (
-                "logit",
-                LogisticRegression(
-                    class_weight="balanced",
-                    solver="liblinear",
-                    random_state=0,
-                ),
-            ),
-        ]
-    )
+    model = build_model_pipeline()
 
     X_train = training_quarters[FEATURE_COLUMNS]
-    y_train = training_quarters["per_capita_recession"].astype(int)
+    y_train = training_quarters[TARGET_COLUMN].astype(int)
     model.fit(X_train, y_train)
 
     scored_daily = yields.copy()
-    scored_daily["recession_probability"] = model.predict_proba(scored_daily[FEATURE_COLUMNS])[:, 1]
+    complete_feature_mask = scored_daily[FEATURE_COLUMNS].notna().all(axis=1)
+    scored_daily["recession_probability"] = np.nan
+    scored_daily.loc[complete_feature_mask, "recession_probability"] = model.predict_proba(
+        scored_daily.loc[complete_feature_mask, FEATURE_COLUMNS]
+    )[:, 1]
     scored_daily["recession_probability_pct"] = scored_daily["recession_probability"] * 100
 
     coefficients = pd.Series(
@@ -318,10 +392,16 @@ def format_probability(value: float) -> str:
 
 def probability_state(value: float) -> tuple[str, str]:
     if value >= 0.60:
-        return "Elevated", "The curve is signaling a meaningfully higher chance of a per-capita recession quarter."
+        return (
+            "Elevated",
+            "The curve is signaling a meaningfully higher chance that Australia is in or enters a per-capita recession over the current-plus-next-two-quarter window.",
+        )
     if value >= 0.30:
-        return "Watch", "The curve is soft enough to justify caution, but it is not yet a high-risk reading."
-    return "Low", "The curve is not currently flashing a strong per-capita recession signal."
+        return (
+            "Watch",
+            "The curve is soft enough to justify caution, but it is not yet a high-risk forward recession reading.",
+        )
+    return "Low", "The curve is not currently flashing a strong forward per-capita recession signal."
 
 
 def spread_state(value: float) -> str:
@@ -340,6 +420,44 @@ def chart_theme() -> dict:
         "margin": {"l": 52, "r": 28, "t": 56, "b": 44},
         "hovermode": "x unified",
     }
+
+
+def find_chart_gaps(dates: pd.Series) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    gap_windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    ordered_dates = pd.Series(dates).dropna().sort_values().tolist()
+    for previous, current in zip(ordered_dates, ordered_dates[1:]):
+        if current - previous > pd.Timedelta(days=GAP_THRESHOLD_DAYS):
+            gap_windows.append((previous + pd.Timedelta(days=1), current - pd.Timedelta(days=1)))
+    return gap_windows
+
+
+def add_gap_bands(fig: go.Figure, gap_windows: list[tuple[pd.Timestamp, pd.Timestamp]]) -> None:
+    for start, end in gap_windows:
+        fig.add_vrect(
+            x0=start,
+            x1=end,
+            fillcolor="rgba(20, 49, 43, 0.06)",
+            line_width=0,
+            layer="below",
+        )
+
+
+def insert_gap_rows(scores: pd.DataFrame, value_columns: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    previous_date: pd.Timestamp | None = None
+    base_columns = ["date", *value_columns]
+
+    for row in scores[base_columns].itertuples(index=False):
+        current_date = row[0]
+        if previous_date is not None and current_date - previous_date > pd.Timedelta(days=GAP_THRESHOLD_DAYS):
+            gap_row = {"date": previous_date + pd.Timedelta(days=1)}
+            for column in value_columns:
+                gap_row[column] = np.nan
+            rows.append(gap_row)
+        rows.append({column: value for column, value in zip(base_columns, row)})
+        previous_date = current_date
+
+    return pd.DataFrame(rows)
 
 
 def add_recession_bands(
@@ -362,26 +480,30 @@ def add_recession_bands(
 
 
 def make_probability_figure(artifacts: ModelArtifacts) -> go.Figure:
-    scores = artifacts.daily_scores
+    scores = artifacts.daily_scores.dropna(subset=["recession_probability_pct"]).copy()
+    chart_scores = insert_gap_rows(scores, ["recession_probability_pct"])
     visible_start = scores["date"].min()
     visible_end = scores["date"].max()
+    gap_windows = find_chart_gaps(scores["date"])
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=scores["date"],
-            y=scores["recession_probability_pct"],
+            x=chart_scores["date"],
+            y=chart_scores["recession_probability_pct"],
             mode="lines",
             name="Probability",
             line={"color": "#0b6e4f", "width": 3},
             fill="tozeroy",
             fillcolor="rgba(11, 110, 79, 0.10)",
+            connectgaps=False,
             hovertemplate="%{x|%d %b %Y}<br>%{y:.1f}%<extra></extra>",
         )
     )
     add_recession_bands(fig, artifacts.gdp_quarters, visible_start, visible_end)
+    add_gap_bands(fig, gap_windows)
     fig.update_layout(
         **chart_theme(),
-        title="Daily Probability of a Current-Quarter Per-Capita Recession",
+        title="Daily Probability of a Per-Capita Recession Through the Current + Next 2 Quarters",
         yaxis={
             "title": "Probability",
             "ticksuffix": "%",
@@ -401,20 +523,24 @@ def make_probability_figure(artifacts: ModelArtifacts) -> go.Figure:
 
 def make_spread_figure(artifacts: ModelArtifacts) -> go.Figure:
     scores = artifacts.daily_scores
+    chart_scores = insert_gap_rows(scores, ["spread"])
     visible_start = scores["date"].min()
     visible_end = scores["date"].max()
+    gap_windows = find_chart_gaps(scores["date"])
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=scores["date"],
-            y=scores["spread"],
+            x=chart_scores["date"],
+            y=chart_scores["spread"],
             mode="lines",
             name="10Y-2Y spread",
             line={"color": "#184e77", "width": 2.6},
+            connectgaps=False,
             hovertemplate="%{x|%d %b %Y}<br>%{y:.2f} pp<extra></extra>",
         )
     )
     add_recession_bands(fig, artifacts.gdp_quarters, visible_start, visible_end)
+    add_gap_bands(fig, gap_windows)
     fig.add_hline(y=0, line_width=1.5, line_dash="dash", line_color="rgba(188, 96, 35, 0.8)")
     fig.update_layout(
         **chart_theme(),
@@ -436,15 +562,18 @@ def make_spread_figure(artifacts: ModelArtifacts) -> go.Figure:
 
 def render_html(artifacts: ModelArtifacts) -> str:
     scores = artifacts.daily_scores
+    scored_window = scores.dropna(subset=["recession_probability"]).copy()
     training = artifacts.training_quarters
 
-    latest = scores.iloc[-1]
+    latest = scored_window.iloc[-1]
     state_label, state_summary = probability_state(float(latest["recession_probability"]))
-    sample_start = scores["date"].min().strftime("%-d %b %Y")
-    sample_end = scores["date"].max().strftime("%-d %b %Y")
+    sample_start = scored_window["date"].min().strftime("%-d %b %Y")
+    sample_end = scored_window["date"].max().strftime("%-d %b %Y")
+    yield_start = scores["date"].min().strftime("%-d %b %Y")
     latest_date = latest["date"].strftime("%-d %b %Y")
     training_end = training["quarter"].max()
-    recession_quarters = int(training["per_capita_recession"].sum())
+    target_positive_quarters = int(training[TARGET_COLUMN].sum())
+    latest_horizon_end = latest["quarter"] + TARGET_FORWARD_QUARTERS
 
     probability_fig = make_probability_figure(artifacts)
     spread_fig = make_spread_figure(artifacts)
@@ -471,7 +600,9 @@ def render_html(artifacts: ModelArtifacts) -> str:
 
     strongest_feature = artifacts.coefficients.abs().sort_values(ascending=False).index[0]
     strongest_coef = FEATURE_LABELS[strongest_feature]
-    current_quarter_label = format_quarter(latest["quarter"])
+    current_window_label = (
+        f"{format_quarter(latest['quarter'])} to {format_quarter(latest_horizon_end)}"
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -678,8 +809,7 @@ def render_html(artifacts: ModelArtifacts) -> str:
         }}
 
         .hero-main,
-        .score-card,
-        .notes .card {{
+        .score-card {{
           padding: 20px;
         }}
 
@@ -698,25 +828,27 @@ def render_html(artifacts: ModelArtifacts) -> str:
       <section class="hero">
         <article class="card hero-main">
           <p class="eyebrow">Australia Macro Signal</p>
-          <h1>Daily Per-Capita Recession Probability</h1>
+          <h1>Forward Per-Capita Recession Probability</h1>
           <p class="hero-copy">
-            A yield-curve-based nowcast for whether <strong>{html.escape(current_quarter_label)}</strong>
-            will eventually be recorded as a per-capita recession quarter in Australia.
-            Amber bands mark historical quarters where seasonally adjusted real GDP per capita
+            A daily yield-curve estimate of whether Australia is in or enters a per-capita
+            recession over the <strong>current quarter plus the next two quarters</strong>.
+            Amber bands mark realized quarters where seasonally adjusted real GDP per capita
             fell for at least two consecutive quarters.
           </p>
           <div class="hero-highlight">
-            <span class="pill">Sample window: {html.escape(sample_start)} to {html.escape(sample_end)}</span>
+            <span class="pill">Probability window: {html.escape(sample_start)} to {html.escape(sample_end)}</span>
+            <span class="pill">Yield history: {html.escape(yield_start)} to {html.escape(sample_end)}</span>
             <span class="pill">Model: standardized logistic regression</span>
             <span class="pill">Signal: 10Y-2Y curve only</span>
           </div>
         </article>
 
         <aside class="card score-card">
-          <h2>Current-Quarter Nowcast</h2>
+          <h2>Current Forward Window</h2>
           <p class="score-number">{html.escape(format_probability(float(latest["recession_probability"])))}</p>
           <div class="score-state">{html.escape(state_label)}</div>
           <p class="metric-note">{html.escape(state_summary)}</p>
+          <p class="metric-note">Forecast window: {html.escape(current_window_label)}</p>
           <p class="metric-note">Latest market close: {html.escape(latest_date)}</p>
         </aside>
       </section>
@@ -730,7 +862,7 @@ def render_html(artifacts: ModelArtifacts) -> str:
         <article class="metric">
           <p class="metric-label">Training Quarters</p>
           <p class="metric-value">{len(training)}</p>
-          <p class="metric-note">{recession_quarters} quarters are labeled recessionary in the usable sample.</p>
+          <p class="metric-note">{target_positive_quarters} quarter-end observations are positive under the forward window target.</p>
         </article>
         <article class="metric">
           <p class="metric-label">Validation Snapshot</p>
@@ -754,7 +886,9 @@ def render_html(artifacts: ModelArtifacts) -> str:
       </section>
 
       <p class="footer">
-        Built from local RBA and ABS workbooks through {html.escape(latest_date)}. Latest GDP-labeled training quarter: {html.escape(format_quarter(training_end))}.
+        Built from local RBA F17, RBA F2, and ABS workbooks through {html.escape(latest_date)}.
+        Latest fully labeled training quarter: {html.escape(format_quarter(training_end))}.
+        Probabilities begin once a full 126-trading-day yield window is available.
       </p>
     </main>
   </body>
@@ -769,10 +903,11 @@ def write_html(path: Path, contents: str) -> None:
 
 def run(args: argparse.Namespace) -> Path:
     yield_path = Path(args.yield_file)
+    f17_path = Path(args.f17_file)
     gdp_path = Path(args.gdp_file)
     html_out = Path(args.html_out)
 
-    yields = load_yield_data(yield_path)
+    yields = load_yield_data(yield_path, f17_path)
     gdp = load_gdp_data(gdp_path)
     artifacts = fit_indicator(yields, gdp)
 
@@ -786,6 +921,13 @@ def run(args: argparse.Namespace) -> Path:
         "to",
         yields["date"].max().date().isoformat(),
     )
+    for source_name, source_data in yields.groupby("yield_source"):
+        print(
+            f"  {source_name}:",
+            source_data["date"].min().date().isoformat(),
+            "to",
+            source_data["date"].max().date().isoformat(),
+        )
     print(
         "GDP labels:",
         gdp["quarter"].min(),
@@ -797,13 +939,22 @@ def run(args: argparse.Namespace) -> Path:
     print(
         "Training sample:",
         len(artifacts.training_quarters),
-        "quarters | recession quarters:",
-        int(artifacts.training_quarters["per_capita_recession"].sum()),
+        "quarters | positive forward-window quarters:",
+        int(artifacts.training_quarters[TARGET_COLUMN].sum()),
     )
-    latest = artifacts.daily_scores.iloc[-1]
+    scored_window = artifacts.daily_scores.dropna(subset=["recession_probability"]).copy()
+    latest = scored_window.iloc[-1]
     print(
-        "Latest nowcast:",
+        "Probability history:",
+        scored_window["date"].min().date().isoformat(),
+        "to",
+        scored_window["date"].max().date().isoformat(),
+    )
+    print(
+        "Latest forward probability:",
         f"{latest['recession_probability_pct']:.1f}%",
+        "| forecast window:",
+        f"{format_quarter(latest['quarter'])} to {format_quarter(latest['quarter'] + TARGET_FORWARD_QUARTERS)}",
         "| latest spread:",
         f"{latest['spread']:.2f} pp",
         "| market date:",
@@ -814,7 +965,11 @@ def run(args: argparse.Namespace) -> Path:
 
 def main() -> None:
     args = parse_args()
-    run(args)
+    try:
+        run(args)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":
